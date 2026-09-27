@@ -1,0 +1,34 @@
+[project]
+name = "actor-critic-walker2d"
+version = "0.1.0"
+description = "Training Walker2D from scratch with Actor-Critic"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "gymnasium[mujoco]>=1.3.0",
+    "jaxtyping>=0.3.11",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "seaborn>=0.13.2",
+    "torch>=2.14.0",
+    "tqdm>=4.70.1",
+    "wandb>=0.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "ruff>=0.16.8",
+]
+
+[tool.ruff]
+line-length = 80
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# jaxtyping tensor shapes are strings, not forward type annotations.
+"src/models/*.py" = ["F722"]
