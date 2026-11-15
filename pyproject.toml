@@ -1,7 +1,7 @@
 [project]
-name = "actor-critic-walker2d"
+name = "ppo-sac-locomotion"
 version = "0.1.0"
-description = "Training Walker2D from scratch with Actor-Critic"
+description = "Implementation of PPO and SAC Actor-Critic Algorithms for Continuous-Control Locomotion Environments"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -29,6 +29,7 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["F722"]
 
 [tool.ruff.lint.per-file-ignores]
 # jaxtyping tensor shapes are strings, not forward type annotations.
