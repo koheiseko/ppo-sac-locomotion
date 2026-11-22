@@ -1,6 +1,8 @@
+import math
+
 import torch
+import torch.nn.functional as F
 from jaxtyping import Float, Int
-from src.policies.utils import layer_init
 from torch import nn
 from torch.distributions import Normal
 
@@ -10,6 +12,8 @@ class GaussianActorPolicy(nn.Module):
         self,
         action_dim: Int,
         observation_dim: Int,
+        min_log_std,
+        max_log_std,
         hidden_dim: Int,
         dtype: torch.dtype,
         device: str,
@@ -18,70 +22,100 @@ class GaussianActorPolicy(nn.Module):
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.observation_dim = observation_dim
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
         self.dtype = dtype
         self.device = device
 
         self.network = nn.Sequential(
-            layer_init(
-                nn.Linear(
-                    self.observation_dim,
-                    self.hidden_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+            nn.Linear(
+                observation_dim,
+                hidden_dim,
+                dtype=self.dtype,
+                device=self.device,
             ),
-            nn.Tanh(),
-            layer_init(
-                nn.Linear(
-                    self.hidden_dim,
-                    self.hidden_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+            nn.ReLU(),
+            nn.Linear(
+                hidden_dim, hidden_dim, dtype=self.dtype, device=self.device
             ),
-            nn.Tanh(),
-            layer_init(
-                nn.Linear(
-                    self.hidden_dim,
-                    self.action_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                std=0.01,
-            ),
+            nn.ReLU(),
         )
-        self.logstd = nn.Parameter(torch.zeros(1, action_dim))
+
+        self.mean = nn.Linear(
+            hidden_dim,
+            action_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        self.log_std = nn.Linear(
+            self.hidden_dim,
+            self.action_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    def forward(
+        self,
+        observation: Float[torch.Tensor, "... observations_dim"],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        features = self.network(observation)
+
+        mean = self.mean(features)
+        log_std = self.log_std(features).clamp(
+            self.min_log_std, self.max_log_std
+        )
+
+        return mean, log_std
 
     def get_distribution(
-        self, observation: Float[torch.Tensor, "... obs_dim"]
-    ) -> torch.distributions.Distribution:
-        action_mean = self.network(observation)
-        action_logstd = self.logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-
-        return Normal(action_mean, action_std)
-
-    def get_action(
         self,
         observation: Float[torch.Tensor, "... obs_dim"],
-        deterministic: bool = False,
-    ) -> Float[torch.Tensor, "... action_dim"]:
-        if deterministic:
-            return self.network(observation)
+    ) -> Normal:
+        mean, log_std = self.forward(observation)
 
-        distribution = self.get_distribution(observation)
+        return Normal(mean, log_std.exp())
 
-        return distribution.sample()
+    @staticmethod
+    def _squashed_log_prob(
+        distribution: Normal,
+        pre_tanh_action: torch.Tensor,
+    ) -> torch.Tensor:
+        u = pre_tanh_action
+        log_det = 2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))
+        return (distribution.log_prob(u) - log_det).sum(dim=-1)
 
-    def evaluate_actions(
+    def sample(
         self,
-        observation: Float[torch.Tensor, "... observation_dim"],
-        action: Float[torch.Tensor, "... action_dim"] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        observation: torch.Tensor,
+        *,
+        reparameterize: bool,
+    ):
         distribution = self.get_distribution(observation)
-        if action is None:
-            action = distribution.sample()
+        pre_tanh_action = (
+            distribution.rsample() if reparameterize else distribution.sample()
+        )
 
-        log_prob = distribution.log_prob(action).sum(dim=-1)
-        entropy = distribution.entropy().sum(dim=-1)
-        return action, log_prob, entropy
+        action = torch.tanh(pre_tanh_action)
+        log_prob = self._squashed_log_prob(distribution, pre_tanh_action)
+
+        return action, pre_tanh_action, log_prob
+
+    def log_prob_from_pre_tanh(
+        self,
+        observation: torch.Tensor,
+        pre_tanh_action: torch.Tensor,
+    ) -> torch.Tensor:
+        distribution = self.get_distribution(observation)
+        return self._squashed_log_prob(distribution, pre_tanh_action)
+
+    def predict(
+        self,
+        observation: Float[torch.Tensor, "... obs_dim"],
+        deterministic: bool = True,
+    ) -> Float[torch.Tensor, "... action_dim"]:
+        distribution = self.get_distribution(observation)
+
+        u = distribution.mean if deterministic else distribution.sample()
+
+        return torch.tanh(u)

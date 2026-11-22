@@ -1,7 +1,7 @@
 import torch
 from jaxtyping import Float
 from src.policies.actor import GaussianActorPolicy
-from src.policies.critc import ValueNetwork
+from src.policies.critic import ValueNetwork
 from torch import nn
 
 
@@ -31,40 +31,27 @@ class PPOAgent(nn.Module):
             observation_dim=self.observation_dim,
             action_dim=self.action_dim,
             hidden_dim=self.hidden_dim,
+            min_log_std=-5.0,
+            max_log_std=2.0,
             dtype=self.dtype,
             device=self.device,
         )
 
-    def get_value(
-        self, observation: Float[torch.Tensor, "... observation_dim"]
-    ) -> Float[torch.Tensor, "... 1"]:
-        return self.critic(observation)
-
-    def get_action(
+    @torch.no_grad()
+    def predict(
         self,
-        observation: Float[torch.Tensor, "... observation_dim"],
+        observations: Float[torch.Tensor, "... obs_dim"],
+        *,
         deterministic: bool = False,
     ) -> Float[torch.Tensor, "... action_dim"]:
-        return self.actor.get_action(observation, deterministic)
+        return self.actor.predict(
+            observations,
+            deterministic=deterministic,
+        )
 
-    def get_action_and_value(
+    def evaluate_actions(
         self,
-        observation: Float[torch.Tensor, "... observation_dim"],
-        action: Float[torch.Tensor, "... action_dim"] | None = None,
-    ) -> tuple[
-        Float[torch.Tensor, "... action_dim"],
-        Float[torch.Tensor, "... action_dim"],
-        Float[torch.Tensor, "... action_dim"],
-        Float[torch.Tensor, "... 1"],
-    ]:
-        action, log_prob, entropy = self.actor.evaluate_actions(
-            observation, action
-        )
-        value = self.critic(observation)
-
-        return (
-            action,
-            log_prob,
-            entropy,
-            value,
-        )
+        observations: torch.Tensor,
+        pre_tanh_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.actor.log_prob_from_pre_tanh(observations, pre_tanh_actions)

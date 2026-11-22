@@ -3,12 +3,12 @@ import numpy as np
 import torch
 
 
+@torch.no_grad()
 def evaluate(
     agent: torch.nn.Module,
     env: gym.Env,
     n_episodes: int = 5,
     seed: int = 42,
-    deterministic: bool = False,
 ) -> tuple[float, float, float]:
     device = next(agent.parameters()).device
 
@@ -19,8 +19,8 @@ def evaluate(
     lengths = []
 
     try:
-        for _ in range(n_episodes):
-            obs, _ = env.reset(seed=seed)
+        for i in range(n_episodes):
+            obs, _ = env.reset(seed=seed + i)
 
             episode_return = 0.0
             episode_length = 0
@@ -36,10 +36,7 @@ def evaluate(
                         device=device,
                     ).unsqueeze(0)
 
-                    action = agent.get_action(
-                        obs,
-                        deterministic=deterministic,
-                    )
+                    action = agent.predict(obs)
 
                     action = action.squeeze(0).cpu().numpy()
 
@@ -52,7 +49,6 @@ def evaluate(
             lengths.append(episode_length)
 
     finally:
-        env.close()
         agent.train(was_training)
 
     return (

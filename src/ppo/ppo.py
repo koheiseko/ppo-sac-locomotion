@@ -11,230 +11,265 @@ from .agent import PPOAgent
 class PPO:
     def __init__(
         self,
-        # Dependencies
         agent: PPOAgent,
         optimizer: torch.optim.Optimizer,
         rollout_buffer: RolloutBuffer,
         envs: gym.vector.VectorEnv,
-        # Environment
         seed: int,
-        # Training
         total_timesteps: int,
         n_steps: int,
-        batch_size: int,
         mini_batch_size: int,
         n_epochs: int,
-        # PPO hyperparameters
         epsilon: float,
         normalize_advantage: bool,
         ent_coef: float,
         vf_coef: float,
-        # Optimization
         lr: float,
         anneal_lr: bool,
-        max_grad_norm: float,
-        # Evalutation
+        max_grad_norm: float | None,
         eval_interval: int,
         eval_n_episodes: int,
-        # Computational
         dtype: torch.dtype,
         device: str | torch.device,
+        *,
+        eval_env: gym.Env | None = None,
     ) -> None:
-        # Dependencies
+        if n_steps <= 0 or mini_batch_size <= 0 or n_epochs <= 0:
+            raise ValueError(
+                "n_steps, mini_batch_size e n_epochs devem ser positivos."
+            )
+
+        if rollout_buffer.buffer_size != n_steps:
+            raise ValueError(
+                "rollout_buffer.buffer_size deve ser igual a n_steps."
+            )
+
+        if rollout_buffer.n_envs != envs.num_envs:
+            raise ValueError("O buffer e o ambiente devem ter o mesmo n_envs.")
+
+        # Dependências
         self.agent = agent
         self.optimizer = optimizer
         self.rollout_buffer = rollout_buffer
         self.envs = envs
+        self.eval_env = eval_env
+        self._initial_lrs = tuple(
+            group["lr"] for group in self.optimizer.param_groups
+        )
 
-        # Environment
+        # Treinamento
         self.seed = seed
-
-        # Training
         self.total_timesteps = total_timesteps
         self.n_steps = n_steps
-        self.batch_size = batch_size
+        self.n_envs = envs.num_envs
+        self.rollout_size = self.n_steps * self.n_envs
         self.mini_batch_size = mini_batch_size
         self.n_epochs = n_epochs
+        self.global_step = 0
 
-        # PPO hyperparameters
+        # PPO
         self.epsilon = epsilon
         self.normalize_advantage = normalize_advantage
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
 
-        # Optimization
+        # Otimização
         self.lr = lr
         self.anneal_lr = anneal_lr
         self.max_grad_norm = max_grad_norm
 
-        # Evaluation
+        # Avaliação
         self.eval_interval = eval_interval
         self.eval_n_episodes = eval_n_episodes
 
-        # Computational
+        # Tensores
         self.dtype = dtype
         self.device = torch.device(device)
 
-        # Derived attributes
-        self.n_iterations = self.total_timesteps // self.batch_size
-
     def train(self):
-        observation, _ = self.envs.reset(seed=self.seed)
+        self.agent.train()
+        self.global_step = 0
 
-        observation = torch.as_tensor(
-            observation, dtype=self.dtype, device=self.device
+        observations, _ = self.envs.reset(seed=self.seed)
+
+        observations = torch.as_tensor(
+            observations,
+            dtype=self.dtype,
+            device=self.device,
         )
 
-        global_step = 0
+        target_steps = (self.total_timesteps // self.n_envs) * self.n_envs
+        metrics: dict[str, float] = {}
+        last_eval_step = 0
 
-        with tqdm(range(self.n_iterations), desc="Training") as pbar:
-            pbar.set_postfix(
-                mean_returns=0.0,
-                std_returns=0.0,
-                mean_lengths=0.0,
-            )
+        with tqdm(total=target_steps, desc="Training") as pbar:
+            while self.global_step < target_steps:
+                if self.anneal_lr:
+                    fraction = 1.0 - self.global_step / target_steps
+                    for group, initial_lr in zip(
+                        self.optimizer.param_groups,
+                        self._initial_lrs,
+                        strict=True,
+                    ):
+                        group["lr"] = initial_lr * fraction
 
-            for iteration in pbar:
+                remaining_vector_steps = (
+                    target_steps - self.global_step
+                ) // self.n_envs
+                rollout_steps = min(self.n_steps, remaining_vector_steps)
                 self.rollout_buffer.reset()
 
-                if self.anneal_lr:
-                    frac = 1.0 - iteration / self.n_iterations
-                    lrnow = frac * self.lr
-
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = lrnow
-
-                for step in range(self.n_steps):
-                    global_step += self.envs.num_envs
-
-                    with torch.no_grad():
-                        action, action_log_prob, _, value = (
-                            self.agent.get_action_and_value(observation)
-                        )
-
-                    env_action = action.detach().cpu().numpy()
-
-                    next_observation, reward, termination, truncation, _ = (
-                        self.envs.step(env_action)
-                    )
-
-                    done = torch.as_tensor(
-                        np.logical_or(termination, truncation),
-                        dtype=torch.bool,
-                        device=self.device,
-                    )
-
-                    reward = torch.as_tensor(
-                        reward, dtype=self.dtype, device=self.device
-                    )
-
-                    self.rollout_buffer.add(
-                        observation,
-                        action,
-                        action_log_prob,
-                        reward,
-                        value,
-                        done,
-                    )
-
-                    observation = next_observation
-
-                    observation = torch.as_tensor(
-                        observation, dtype=self.dtype, device=self.device
-                    )
+                for _ in range(rollout_steps):
+                    observations = self._collect_step(observations)
+                    pbar.update(self.n_envs)
 
                 with torch.no_grad():
-                    last_value = self.agent.get_value(observation)
+                    last_value = self.agent.critic(observations)
+                    self.rollout_buffer.compute_gae(last_value)
 
-                advantages, returns = self.rollout_buffer.compute_gae(
-                    last_value=last_value
-                )
-
-                buffer = self.rollout_buffer
-
-                b_observations = buffer.observations.reshape(
-                    (-1,) + self.envs.single_observation_space.shape
-                )
-                b_action_log_probs = buffer.action_log_probs.reshape(-1)
-                b_actions = buffer.actions.reshape(
-                    (-1,) + self.envs.single_action_space.shape
-                )
-                b_advantages = advantages.reshape(-1)
-                b_returns = returns.reshape(-1)
-
-                for epoch in range(self.n_epochs):
-                    b_ids = torch.randperm(self.batch_size, device=self.device)
-
-                    for start in range(
-                        0,
-                        self.batch_size,
-                        self.mini_batch_size,
+                for _ in range(self.n_epochs):
+                    for batch in self.rollout_buffer.iter_minibatches(
+                        self.mini_batch_size
                     ):
-                        mb_ids = b_ids[start : start + self.mini_batch_size]
+                        metrics.update(self._update(batch))
 
-                        _, new_action_log_probs, entropys, new_values = (
-                            self.agent.get_action_and_value(
-                                b_observations[mb_ids],
-                                b_actions[mb_ids],
-                            )
-                        )
+                if (
+                    self.eval_env is not None
+                    and self.eval_interval > 0
+                    and self.global_step - last_eval_step >= self.eval_interval
+                ):
+                    metrics.update(self.evaluate())
+                    last_eval_step = self.global_step
 
-                        ratio = torch.exp(
-                            new_action_log_probs - b_action_log_probs[mb_ids]
-                        )
+                pbar.set_postfix(metrics)
 
-                        mb_advantages = b_advantages[mb_ids]
+        return metrics
 
-                        if self.normalize_advantage:
-                            mb_advantages = (
-                                mb_advantages - mb_advantages.mean()
-                            ) / (mb_advantages.std(unbiased=False) + 1e-8)
+    def _compute_gae(self, last_value):
+        return self.rollout_buffer.compute_gae(last_value)
 
-                        pg_loss1 = -mb_advantages * ratio
+    @torch.no_grad()
+    def _collect_step(self, observations):
+        action, pre_tanh_action, log_prob = self.agent.actor.sample(
+            observations,
+            reparameterize=False,
+        )
+        values = self.agent.critic(observations)
 
-                        pg_loss2 = -mb_advantages * torch.clamp(
-                            ratio,
-                            min=1.0 - self.epsilon,
-                            max=1.0 + self.epsilon,
-                        )
+        next_observations, rewards, terminated, truncated, infos = (
+            self.envs.step(action.cpu().numpy())
+        )
 
-                        policy_loss = torch.max(pg_loss1, pg_loss2).mean()
+        done = terminated | truncated
+        transition_next_obs = next_observations.copy()
 
-                        new_values = new_values.flatten()
+        for i in np.flatnonzero(done):
+            transition_next_obs[i] = infos["final_obs"][i]
 
-                        loss_v = (
-                            0.5 * (new_values - b_returns[mb_ids]).pow(2).mean()
-                        )
+        reward_tensor = torch.as_tensor(
+            rewards, dtype=self.dtype, device=self.device
+        )
 
-                        loss_entropy = entropys.mean()
+        timeout_ids = np.flatnonzero(truncated & ~terminated)
+        if timeout_ids.size:
+            final_obs = torch.as_tensor(
+                transition_next_obs[timeout_ids],
+                dtype=self.dtype,
+                device=self.device,
+            )
+            final_values = self.agent.critic(final_obs).reshape(-1)
 
-                        loss = (
-                            policy_loss
-                            + self.vf_coef * loss_v
-                            - self.ent_coef * loss_entropy
-                        )
+            indices = torch.as_tensor(
+                timeout_ids, dtype=torch.long, device=self.device
+            )
+            reward_tensor = reward_tensor.clone()
+            reward_tensor[indices] += self.rollout_buffer.gamma * final_values
 
-                        self.optimizer.zero_grad()
-                        loss.backward()
+        self.rollout_buffer.add(
+            observation=observations,
+            action=action,
+            pre_tanh_action=pre_tanh_action,
+            action_log_prob=log_prob,
+            reward=reward_tensor,
+            value=values,
+            done=torch.as_tensor(done, dtype=torch.bool, device=self.device),
+        )
 
-                        torch.nn.utils.clip_grad_norm_(
-                            self.agent.parameters(),
-                            max_norm=self.max_grad_norm,
-                        )
+        self.global_step += self.envs.num_envs
 
-                        self.optimizer.step()
+        return torch.as_tensor(
+            next_observations, dtype=self.dtype, device=self.device
+        )
 
-                if iteration % self.eval_interval == 0:
-                    env = self.envs.envs[0]
+    def _get_actor_loss(self, batch):
+        new_log_probs = self.agent.evaluate_actions(
+            batch["observations"],
+            batch["pre_tanh_actions"],
+        )
 
-                    mean_returns, std_returns, mean_lengths = evaluate(
-                        agent=self.agent,
-                        env=env,
-                        n_episodes=self.eval_n_episodes,
-                    )
+        ratio = (new_log_probs - batch["old_log_probs"]).exp()
 
-                    pbar.set_postfix(
-                        mean_returns=mean_returns,
-                        std_returns=std_returns,
-                        mean_lengths=mean_lengths,
-                    )
+        advantages = batch["advantages"]
+
+        if self.normalize_advantage and advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std(unbiased=False) + 1e-8
+            )
+
+        clipped_ratio = ratio.clamp(
+            min=1.0 - self.epsilon,
+            max=1.0 + self.epsilon,
+        )
+        actor_loss = -torch.minimum(
+            ratio * advantages,
+            clipped_ratio * advantages,
+        ).mean()
+
+        if self.ent_coef:
+            _, _, log_prob = self.agent.actor.sample(
+                batch["observations"], reparameterize=True
+            )
+            actor_loss = actor_loss + self.ent_coef * log_prob.mean()
+
+        return actor_loss
+
+    def _get_critic_loss(self, batch):
+        predicted_values = self.agent.critic(batch["observations"]).reshape(-1)
+        target_returns = batch["returns"]
+
+        return 0.5 * (predicted_values - target_returns).square().mean()
+
+    def _update(self, batch: dict[str, any]) -> dict[str, float]:
+        actor_loss = self._get_actor_loss(batch)
+        critic_loss = self._get_critic_loss(batch)
+
+        loss = actor_loss + self.vf_coef * critic_loss
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                self.agent.parameters(),
+                self.max_grad_norm,
+            )
+        self.optimizer.step()
+
+        return {
+            "loss": loss.item(),
+            "actor_loss": actor_loss.item(),
+            "critic_loss": critic_loss.item(),
+        }
+
+    def evaluate(self) -> dict[str, float]:
+        mean_return, std_return, mean_length = evaluate(
+            agent=self.agent,
+            env=self.eval_env,
+            n_episodes=self.eval_n_episodes,
+            seed=self.seed,
+        )
+
+        return {
+            "eval_mean_return": mean_return,
+            "eval_std_return": std_return,
+            "eval_mean_length": mean_length,
+        }
