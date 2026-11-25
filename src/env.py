@@ -1,4 +1,7 @@
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, is_dataclass
+from pathlib import Path
+from typing import Any
 
 import gymnasium as gym
 
@@ -77,19 +80,35 @@ class HumanoidConfig:
 
 
 def make_env(
-    config,
+    config: Any,
     render_mode: str | None = None,
-    record_video: bool | None = None,
-    video_dir: str | None = None,
-    seed: int | None = 42,
+    record_video: bool = False,
+    video_dir: str | Path | None = None,
+    name_prefix: str = "rl-video",
+    episode_trigger: Callable[[int], bool] | None = None,
+    seed: int = 42,
 ):
     def thunk():
-        env = gym.make(render_mode=render_mode, **config)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
+        env_kwargs = asdict(config) if is_dataclass(config) else dict(config)
+        effective_render_mode = "rgb_array" if record_video else render_mode
+
+        env = gym.make(render_mode=effective_render_mode, **env_kwargs)
 
         if record_video:
-            env = gym.wrappers.RecordVideo(env, video_folder=str(video_dir))
+            if video_dir is None:
+                raise ValueError(
+                    "video_dir deve ser informado quando record_video=True."
+                )
+            env = gym.wrappers.RecordVideo(
+                env,
+                video_folder=str(video_dir),
+                name_prefix=name_prefix,
+                episode_trigger=episode_trigger,
+                disable_logger=True,
+            )
+
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.ClipAction(env)
 
         env.action_space.seed(seed)
         env.observation_space.seed(seed)

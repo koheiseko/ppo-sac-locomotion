@@ -2,6 +2,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb
 from jaxtyping import Float
 from src.buffers.replay import ReplayBuffer
 from src.sac.agent import SACAgent
@@ -18,7 +19,6 @@ class SAC:
         actor_optimizer: torch.optim.Optimizer,
         replay_buffer: ReplayBuffer,
         envs: gym.vector.VectorEnv,
-        eval_env: gym.Env,
         # Environment
         seed: int,
         # Training
@@ -39,6 +39,12 @@ class SAC:
         # Computational
         dtype: torch.dtype,
         device: str | torch.device,
+        *,
+        log_interval: int = 1_000,
+        wandb_log: bool = False,
+        wandb_name: str | None = None,
+        wandb_project: str | None = None,
+        eval_env: gym.Env | None = None,
     ) -> None:
         # Dependencies
         self.agent = agent
@@ -73,15 +79,26 @@ class SAC:
         self.eval_interval = eval_interval
         self.eval_n_episodes = eval_n_episodes
 
+        # Logger
+
+        self.log_interval = log_interval
+        self.wandb_log = wandb_log
+        self.wandb_name = wandb_name
+        self.wandb_project = wandb_project
+
         # Computational
         self.dtype = dtype
         self.device = torch.device(device)
 
-        # Derived attributes
-        self.n_iterations = self.total_timesteps // self.batch_size
-
     def train(self) -> None:
+        run = None
+
+        if self.wandb_log:
+            run = wandb.init(project=self.wandb_project, name=self.wandb_name)
+
         self.agent.train()
+        self.global_step = 0
+        self.gradient_step = 0
 
         observations, _ = self.envs.reset(seed=self.seed)
 
@@ -91,27 +108,109 @@ class SAC:
             device=self.device,
         )
 
-        metrics = {}
+        target_steps = (self.total_timesteps // self.n_envs) * self.n_envs
         last_eval_step = 0
+        last_log_step = 0
 
-        with tqdm(
-            total=self.total_timesteps,
-            desc="Training",
-        ) as pbar:
-            while self.global_step < self.total_timesteps:
+        train_metrics: list[dict[str, float]] = []
+        eval_metrics: list[dict[str, float]] = []
+
+        window_critic_losses: list[float] = []
+        window_actor_losses: list[float] = []
+
+        pbar_postfix: dict[str, str] = {"status": "warmup"}
+
+        with tqdm(total=target_steps, desc="Training") as pbar:
+            pbar.set_postfix(pbar_postfix, refresh=False)
+
+            while self.global_step < target_steps:
                 observations = self._collect_step(observations)
+
+                pbar.update(self.n_envs)
 
                 if self.global_step >= self.learning_starts:
                     batch = self.replay_buffer.sample(self.batch_size)
+                    critic_loss, actor_loss = self._update(batch)
 
-                    metrics.update(self._update(batch))
+                    window_critic_losses.append(critic_loss)
+                    if actor_loss is not None:
+                        window_actor_losses.append(actor_loss)
 
-                if self.global_step - last_eval_step >= self.eval_interval:
-                    metrics.update(self.evaluate())
-                    last_eval_step = self.global_step
+                    if (
+                        self.global_step - last_log_step >= self.log_interval
+                        or self.global_step >= target_steps
+                    ):
+                        last_log_step = self.global_step
+                        mean_critic = sum(window_critic_losses) / len(
+                            window_critic_losses
+                        )
 
-                pbar.update(self.n_envs)
-                pbar.set_postfix(metrics)
+                        train_entry: dict[str, float] = {
+                            "step": self.global_step,
+                            "critic_loss": mean_critic,
+                        }
+                        wandb_payload: dict[str, float] = {
+                            "train/critic_loss": mean_critic,
+                        }
+
+                        pbar_postfix.pop("status", None)
+                        pbar_postfix["critic_loss"] = f"{mean_critic:.3f}"
+
+                        if window_actor_losses:
+                            mean_actor = sum(window_actor_losses) / len(
+                                window_actor_losses
+                            )
+                            train_entry["actor_loss"] = mean_actor
+                            wandb_payload["train/actor_loss"] = mean_actor
+                            pbar_postfix["actor_loss"] = f"{mean_actor:.3f}"
+
+                        train_metrics.append(train_entry)
+
+                        pbar.set_postfix(pbar_postfix, refresh=True)
+
+                        window_critic_losses.clear()
+                        window_actor_losses.clear()
+
+                        if self.wandb_log:
+                            run.log(wandb_payload, step=self.global_step)
+
+                    if (
+                        self.eval_env is not None
+                        and self.eval_interval > 0
+                        and self.global_step - last_eval_step
+                        >= self.eval_interval
+                    ):
+                        mean_return, std_return, mean_length = self.evaluate()
+                        last_eval_step = self.global_step
+
+                        eval_metrics.append(
+                            {
+                                "step": self.global_step,
+                                "mean_return": float(mean_return),
+                                "std_return": float(std_return),
+                                "mean_length": float(mean_length),
+                            }
+                        )
+
+                        if self.wandb_log:
+                            run.log(
+                                {
+                                    "eval/mean_return": mean_return,
+                                    "eval/std_return": std_return,
+                                    "eval/mean_length": mean_length,
+                                },
+                                step=self.global_step,
+                            )
+
+                        pbar_postfix["eval_return"] = (
+                            f"{mean_return:.1f}±{std_return:.1f}"
+                        )
+                        pbar.set_postfix(pbar_postfix, refresh=True)
+
+        if self.wandb_log:
+            run.finish()
+
+        return train_metrics, eval_metrics
 
     @torch.no_grad()
     def _sample_actions(
@@ -230,7 +329,6 @@ class SAC:
         self,
         observation: Float[torch.Tensor, "batch_size obs_dim"],
     ) -> float:
-
         critic = self.agent.critic
 
         critic.requires_grad_(False)
@@ -264,24 +362,23 @@ class SAC:
     def _update(
         self,
         batch: dict[str, torch.Tensor],
-    ) -> dict[str, float]:
-
-        metrics = {}
-
-        metrics["critic_loss"] = self._update_critic(batch)
+    ) -> tuple[float]:
+        critic_loss = self._update_critic(batch)
+        actor_loss: float | None = None
 
         self.gradient_step += 1
-
-        if self.gradient_step % self.policy_frequency == 0:
-            for _ in range(self.policy_frequency):
-                metrics["actor_loss"] = self._update_actor(
-                    batch["observations"]
-                )
 
         if self.gradient_step % self.target_network_frequency == 0:
             self.agent.update_target_network(self.tau)
 
-        return metrics
+        if self.gradient_step % self.policy_frequency == 0:
+            actor_losses = [
+                self._update_actor(batch["observations"])
+                for _ in range(self.policy_frequency)
+            ]
+            actor_loss = sum(actor_losses) / len(actor_losses)
+
+        return critic_loss, actor_loss
 
     def evaluate(self) -> dict[str, float]:
         mean_return, std_return, mean_length = evaluate(
@@ -291,8 +388,4 @@ class SAC:
             seed=self.seed,
         )
 
-        return {
-            "eval_mean_return": mean_return,
-            "eval_std_return": std_return,
-            "eval_mean_length": mean_length,
-        }
+        return mean_return, std_return, mean_length

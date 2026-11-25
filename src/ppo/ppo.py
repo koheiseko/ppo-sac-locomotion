@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import torch
+import wandb
 from src.buffers.rollout import RolloutBuffer
 from src.utils import evaluate
 from tqdm import tqdm
@@ -32,6 +33,9 @@ class PPO:
         dtype: torch.dtype,
         device: str | torch.device,
         *,
+        wandb_log: bool = False,
+        wandb_name: str | None = None,
+        wandb_project: str | None = None,
         eval_env: gym.Env | None = None,
     ) -> None:
         if n_steps <= 0 or mini_batch_size <= 0 or n_epochs <= 0:
@@ -82,11 +86,22 @@ class PPO:
         self.eval_interval = eval_interval
         self.eval_n_episodes = eval_n_episodes
 
+        # Logger
+
+        self.wandb_log = wandb_log
+        self.wandb_name = wandb_name
+        self.wandb_project = wandb_project
+
         # Tensores
         self.dtype = dtype
         self.device = torch.device(device)
 
     def train(self):
+        run = None
+
+        if self.wandb_log:
+            run = wandb.init(project=self.wandb_project, name=self.wandb_name)
+
         self.agent.train()
         self.global_step = 0
 
@@ -99,8 +114,12 @@ class PPO:
         )
 
         target_steps = (self.total_timesteps // self.n_envs) * self.n_envs
-        metrics: dict[str, float] = {}
         last_eval_step = 0
+
+        train_metrics = []
+        eval_metrics = []
+
+        pbar_postfix = {}
 
         with tqdm(total=target_steps, desc="Training") as pbar:
             while self.global_step < target_steps:
@@ -127,23 +146,94 @@ class PPO:
                     last_value = self.agent.critic(observations)
                     self.rollout_buffer.compute_gae(last_value)
 
+                update_losses = []
+                update_actor_losses = []
+                update_critic_losses = []
+
                 for _ in range(self.n_epochs):
                     for batch in self.rollout_buffer.iter_minibatches(
                         self.mini_batch_size
                     ):
-                        metrics.update(self._update(batch))
+                        loss, actor_loss, critic_loss = self._update(batch)
+
+                        update_losses.append(float(loss))
+                        update_actor_losses.append(float(actor_loss))
+                        update_critic_losses.append(float(critic_loss))
+
+                mean_loss = sum(update_losses) / len(update_losses)
+                mean_actor_loss = sum(update_actor_losses) / len(
+                    update_actor_losses
+                )
+                mean_critic_loss = sum(update_critic_losses) / len(
+                    update_critic_losses
+                )
+                current_lr = self.optimizer.param_groups[0]["lr"]
+
+                train_entry = {
+                    "step": self.global_step,
+                    "loss": mean_loss,
+                    "actor_loss": mean_actor_loss,
+                    "critic_loss": mean_critic_loss,
+                    "lr": current_lr,
+                }
+                train_metrics.append(train_entry)
+
+                if self.wandb_log:
+                    run.log(
+                        {
+                            "train/loss": mean_loss,
+                            "train/actor_loss": mean_actor_loss,
+                            "train/critic_loss": mean_critic_loss,
+                            "train/lr": current_lr,
+                        },
+                        step=self.global_step,
+                    )
+
+                pbar_postfix.update(
+                    {
+                        "loss": f"{mean_loss:.3f}",
+                        "actor_loss": f"{mean_actor_loss:.3f}",
+                        "critic_loss": f"{mean_critic_loss:.3f}",
+                    }
+                )
+                pbar.set_postfix(pbar_postfix, refresh=True)
 
                 if (
                     self.eval_env is not None
                     and self.eval_interval > 0
                     and self.global_step - last_eval_step >= self.eval_interval
                 ):
-                    metrics.update(self.evaluate())
+                    mean_return, std_return, mean_length = self.evaluate()
                     last_eval_step = self.global_step
 
-                pbar.set_postfix(metrics)
+                    eval_metrics.append(
+                        {
+                            "step": self.global_step,
+                            "mean_return": float(mean_return),
+                            "std_return": float(std_return),
+                            "mean_length": float(mean_length),
+                        }
+                    )
 
-        return metrics
+                    if self.wandb_log:
+                        run.log(
+                            {
+                                "eval/mean_return": mean_return,
+                                "eval/std_return": std_return,
+                                "eval/mean_length": mean_length,
+                            },
+                            step=self.global_step,
+                        )
+
+                    pbar_postfix["eval_return"] = (
+                        f"{mean_return:.1f}±{std_return:.1f}"
+                    )
+                    pbar.set_postfix(pbar_postfix, refresh=True)
+
+        if self.wandb_log:
+            run.finish()
+
+        return train_metrics, eval_metrics
 
     def _compute_gae(self, last_value):
         return self.rollout_buffer.compute_gae(last_value)
@@ -239,7 +329,7 @@ class PPO:
 
         return 0.5 * (predicted_values - target_returns).square().mean()
 
-    def _update(self, batch: dict[str, any]) -> dict[str, float]:
+    def _update(self, batch: dict[str, any]) -> tuple[float]:
         actor_loss = self._get_actor_loss(batch)
         critic_loss = self._get_critic_loss(batch)
 
@@ -254,11 +344,7 @@ class PPO:
             )
         self.optimizer.step()
 
-        return {
-            "loss": loss.item(),
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-        }
+        return loss.item(), actor_loss.item(), critic_loss.item()
 
     def evaluate(self) -> dict[str, float]:
         mean_return, std_return, mean_length = evaluate(
@@ -268,8 +354,4 @@ class PPO:
             seed=self.seed,
         )
 
-        return {
-            "eval_mean_return": mean_return,
-            "eval_std_return": std_return,
-            "eval_mean_length": mean_length,
-        }
+        return mean_return, std_return, mean_length
