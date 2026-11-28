@@ -1536,7 +1536,7 @@ wheels = [
 [[package]]
 name = "ppo-sac-locomotion"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "glfw" },
     { name = "gymnasium", extra = ["mujoco"] },
